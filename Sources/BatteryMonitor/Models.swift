@@ -41,3 +41,11 @@ struct BatterySnapshot: Codable, Sendable, Identifiable {
         return Double(maxCapacityMAh) / Double(designCapacityMAh) * 100
     }
 }
+
+struct ProcessImpact: Codable, Sendable, Identifiable {
+    var id: Int { pid }
+    var pid: Int
+    var name: String
+    var cpuPercent: Double
+    var estimatedShare: Double
+}
