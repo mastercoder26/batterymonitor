@@ -92,3 +92,30 @@ enum HistoryPeriod: String, CaseIterable, Identifiable {
         switch self { case .today: 86_400; case .week: 7 * 86_400; case .month: 30 * 86_400 }
     }
 }
+
+struct AppSettings: Codable, Sendable {
+    enum MenuStyle: String, CaseIterable, Codable, Sendable {
+        case percentage, percentageTime, percentageWatts, time, icon
+        var label: String {
+            switch self {
+            case .percentage: "82%"
+            case .percentageTime: "82% • 5h 12m"
+            case .percentageWatts: "82% • 7.4 W"
+            case .time: "5h 12m"
+            case .icon: "Icon only"
+            }
+        }
+    }
+    var menuStyle: MenuStyle = .percentageWatts
+    var lowBatteryAlert = true
+    var fullChargeAlert = true
+    var highDrainAlert = true
+    var highTemperatureAlert = true
+    var healthAlert = true
+    var chargerDisconnectedAlert = false
+    var chargeTargetAlert = false
+    var chargeTargetPercent = 80
+    var highTemperatureThreshold = 45.0
+    var highDrainThreshold = 20.0
+    var healthThreshold = 80.0
+}
