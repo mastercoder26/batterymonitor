@@ -1,18 +1,38 @@
 import AppKit
 import Foundation
 import Observation
+import UserNotifications
+
+enum ExperimentPhase: String, Codable, Sendable { case first, second, complete }
+
+struct PowerExperiment: Codable, Sendable {
+    var title: String
+    var firstLabel: String
+    var secondLabel: String
+    var phase: ExperimentPhase = .first
+    var firstAverageWatts: Double?
+    var secondAverageWatts: Double?
+    var startedAt: Date = .now
+    var phaseStartedAt: Date = .now
+    var firstReadings: [Double] = []
+    var secondReadings: [Double] = []
+}
 
 @MainActor @Observable
 final class AppModel {
+    private static let minimumExperimentDuration: TimeInterval = 2 * 60
+    private static let minimumExperimentReadings = 5
     private let reader = BatteryReader()
     private let processReader = ProcessReader()
     private let store = HistoryStore()
     private var pollingTask: Task<Void, Never>?
     private var lastRecordedAt: Date = .distantPast
+    private var lastAlertAt: [String: Date] = [:]
     private var lastEventAt: [TimelineEventKind: Date] = [:]
     private var workspaceObservers: [NSObjectProtocol] = []
     private var pendingSleepAt: Date?
     private var refreshInProgress = false
+    private var lastExperimentSampleAt: Date = .distantPast
     /// Retain the last valid reading across temporary sensor failures so a
     /// recovered sensor does not look like a fresh threshold crossing.
     private var lastSensorSnapshot: BatterySnapshot?
@@ -30,11 +50,31 @@ final class AppModel {
     var processes: [ProcessImpact] = []
     var sessions: [ChargingSession] = []
     var analytics: BatteryAnalytics?
+    var experiment: PowerExperiment?
     var selectedPeriod: HistoryPeriod = .today {
         didSet { Task { await loadHistory() } }
     }
     var settings: AppSettings = AppModel.loadSettings() {
-        didSet { Self.saveSettings(settings) }
+        didSet {
+            Self.saveSettings(settings)
+            Task { await checkUpdatedThresholds(previous: oldValue) }
+        }
+    }
+
+    var experimentCanAdvance: Bool {
+        guard let experiment, experiment.phase != .complete, snapshot?.source == .battery else { return false }
+        let count = experiment.phase == .first ? experiment.firstReadings.count : experiment.secondReadings.count
+        return count >= Self.minimumExperimentReadings && Date.now.timeIntervalSince(experiment.phaseStartedAt) >= Self.minimumExperimentDuration
+    }
+
+    var experimentProgressText: String? {
+        guard let experiment, experiment.phase != .complete else { return nil }
+        guard snapshot?.source == .battery else { return "Unplug the charger to collect comparable battery readings." }
+        let count = experiment.phase == .first ? experiment.firstReadings.count : experiment.secondReadings.count
+        let remaining = max(0, Int(ceil(Self.minimumExperimentDuration - Date.now.timeIntervalSince(experiment.phaseStartedAt))))
+        if remaining > 0 { return "Keep this workload for about \((remaining + 59) / 60) more min." }
+        if count < Self.minimumExperimentReadings { return "Collecting readings (\(count)/\(Self.minimumExperimentReadings))." }
+        return "Ready for the next step."
     }
 
     var menuBarTitle: String {
@@ -103,6 +143,24 @@ final class AppModel {
         snapshot = current
         processes = collectProcessActivity ? processReader.sample() : []
         lastSensorSnapshot = current
+        if let activeExperiment = experiment, activeExperiment.phase != .complete,
+           previous?.source != current.source {
+            // A charger change makes readings from either step incomparable.
+            experiment = PowerExperiment(title: activeExperiment.title,
+                                         firstLabel: activeExperiment.firstLabel,
+                                         secondLabel: activeExperiment.secondLabel,
+                                         startedAt: current.date,
+                                         phaseStartedAt: current.date)
+            lastExperimentSampleAt = .distantPast
+        }
+        if current.source == .battery, let drain = current.drainWatts, drain > 0, drain.isFinite,
+           current.date.timeIntervalSince(lastExperimentSampleAt) >= 15,
+           (experiment?.phase == .first || experiment?.phase == .second) {
+            if experiment?.phase == .first { experiment?.firstReadings.append(drain) }
+            else { experiment?.secondReadings.append(drain) }
+            lastExperimentSampleAt = current.date
+        }
+
         let recordedEvent = await detectEvents(previous: previous, current: current, previousProcesses: previousProcesses)
         if current.date.timeIntervalSince(lastRecordedAt) >= 60 {
             await store.record(snapshot: current, processes: processes)
@@ -111,6 +169,38 @@ final class AppModel {
         } else if recordedEvent {
             await loadHistory()
         }
+    }
+
+    func startExperiment(name: String) {
+        guard snapshot?.source == .battery else { return }
+        let parts = name.components(separatedBy: " vs ")
+        let first = parts.first?.trimmingCharacters(in: .whitespaces) ?? "A"
+        let second = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : "B"
+        experiment = PowerExperiment(title: name, firstLabel: first, secondLabel: second)
+        lastExperimentSampleAt = .distantPast
+    }
+
+    func advanceExperiment() {
+        guard experimentCanAdvance, var experiment else { return }
+        switch experiment.phase {
+        case .first:
+            guard !experiment.firstReadings.isEmpty else { return }
+            experiment.firstAverageWatts = experiment.firstReadings.reduce(0, +) / Double(experiment.firstReadings.count)
+            experiment.phase = .second
+            experiment.phaseStartedAt = .now
+            lastExperimentSampleAt = .distantPast
+        case .second:
+            guard !experiment.secondReadings.isEmpty else { return }
+            experiment.secondAverageWatts = experiment.secondReadings.reduce(0, +) / Double(experiment.secondReadings.count)
+            experiment.phase = .complete
+        case .complete: break
+        }
+        self.experiment = experiment
+    }
+
+    func stopExperiment() {
+        experiment = nil
+        lastExperimentSampleAt = .distantPast
     }
 
     private func loadHistory() async {
@@ -132,7 +222,6 @@ final class AppModel {
         }
         await loadHistory()
     }
-
 
     private func detectEvents(previous: BatterySnapshot?, current: BatterySnapshot, previousProcesses: [ProcessImpact]) async -> Bool {
         var detected: [(TimelineEventKind, String?)] = []
@@ -169,6 +258,10 @@ final class AppModel {
         var recorded = false
         for (kind, detail) in detected {
             recorded = await recordEvent(kind, at: current.date, detail: detail) || recorded
+        }
+        if settings.chargeTargetAlert, (previous?.percentage ?? 0) < Double(settings.chargeTargetPercent),
+           current.percentage >= Double(settings.chargeTargetPercent), current.source == .charger {
+            await sendAlert(key: "target", title: "Charge target reached", body: "Battery reached \(settings.chargeTargetPercent)%.", enabled: true)
         }
         return recorded
     }
@@ -208,7 +301,62 @@ final class AppModel {
         let event = TimelineEvent(date: date, kind: kind, detail: detail)
         lastEventAt[kind] = date
         await store.record(event: event)
+        await notify(for: event)
         return true
+    }
+
+    private func checkUpdatedThresholds(previous: AppSettings) async {
+        guard let snapshot else { return }
+        var changed = false
+        if snapshot.source == .battery, let drain = snapshot.drainWatts,
+           settings.highDrainThreshold != previous.highDrainThreshold,
+           drain >= settings.highDrainThreshold, drain < previous.highDrainThreshold {
+            changed = await recordEvent(.highDrain, at: .now, detail: String(format: "%.1f W drain", drain)) || changed
+        }
+        if let temperature = snapshot.temperatureCelsius,
+           settings.highTemperatureThreshold != previous.highTemperatureThreshold,
+           temperature >= settings.highTemperatureThreshold, temperature < previous.highTemperatureThreshold {
+            changed = await recordEvent(.highTemperature, at: .now, detail: String(format: "%.1f°C", temperature)) || changed
+        }
+        if let health = snapshot.healthPercent,
+           settings.healthThreshold != previous.healthThreshold,
+           health <= settings.healthThreshold, health > previous.healthThreshold {
+            changed = await recordEvent(.healthDrop, at: .now, detail: String(format: "%.0f%% health", health)) || changed
+        }
+        if changed { await loadHistory() }
+    }
+
+    private func notify(for event: TimelineEvent) async {
+        switch event.kind {
+        case .lowBattery: await sendAlert(key: "low", title: "Battery reached 20%", body: "Connect a charger when convenient.", enabled: settings.lowBatteryAlert)
+        case .fullCharge: await sendAlert(key: "full", title: "Battery is fully charged", body: "Your Mac reached 100%.", enabled: settings.fullChargeAlert)
+        case .highDrain: await sendAlert(key: "drain", title: "High battery drain", body: event.detail ?? "Power use is above your selected threshold.", enabled: settings.highDrainAlert)
+        case .chargerDisconnected: await sendAlert(key: "unplugged", title: "Charger disconnected", body: "Your Mac is running on battery.", enabled: settings.chargerDisconnectedAlert)
+        case .highTemperature: await sendAlert(key: "temperature", title: "Battery is warm", body: event.detail ?? "Temperature crossed your selected threshold.", enabled: settings.highTemperatureAlert)
+        case .healthDrop: await sendAlert(key: "health", title: "Battery health threshold reached", body: event.detail ?? "Battery health crossed your selected threshold.", enabled: settings.healthAlert)
+        default: break
+        }
+    }
+
+    private func sendAlert(key: String, title: String, body: String, enabled: Bool) async {
+        guard enabled, Date.now.timeIntervalSince(lastAlertAt[key] ?? .distantPast) > 1800 else { return }
+        let center = UNUserNotificationCenter.current()
+        let status = await center.notificationSettings().authorizationStatus
+        switch status {
+        case .authorized, .provisional, .ephemeral: break
+        case .notDetermined:
+            guard (try? await center.requestAuthorization(options: [.alert, .sound])) == true else { return }
+        default: return
+        }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        do {
+            try await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+            lastAlertAt[key] = .now
+        } catch {
+            // A later threshold crossing may retry if notification delivery failed.
+        }
     }
 
     private static func loadSettings() -> AppSettings {
