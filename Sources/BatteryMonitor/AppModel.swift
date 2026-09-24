@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 
@@ -8,7 +9,13 @@ final class AppModel {
     private let store = HistoryStore()
     private var pollingTask: Task<Void, Never>?
     private var lastRecordedAt: Date = .distantPast
+    private var lastEventAt: [TimelineEventKind: Date] = [:]
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var pendingSleepAt: Date?
     private var refreshInProgress = false
+    /// Retain the last valid reading across temporary sensor failures so a
+    /// recovered sensor does not look like a fresh threshold crossing.
+    private var lastSensorSnapshot: BatterySnapshot?
 
     var snapshot: BatterySnapshot?
     var historyError: String?
@@ -59,6 +66,7 @@ final class AppModel {
 
     func run() async {
         guard pollingTask == nil else { return }
+        observeSleepAndWake()
         pollingTask = Task { [weak self] in
             await self?.initialize()
             while !Task.isCancelled {
@@ -70,6 +78,14 @@ final class AppModel {
     }
 
     private func initialize() async {
+        let recentEvents = await store.events(for: .month)
+        for event in recentEvents { lastEventAt[event.kind] = event.date }
+        let recentSnapshots = await store.snapshots(for: .month)
+        if let latest = recentSnapshots.last,
+           Date.now.timeIntervalSince(latest.date) >= 0,
+           Date.now.timeIntervalSince(latest.date) <= 2 * 60 {
+            lastSensorSnapshot = latest
+        }
         await loadHistory()
         await refresh()
     }
@@ -82,11 +98,17 @@ final class AppModel {
             snapshot = nil
             return
         }
+        let previous = lastSensorSnapshot
+        let previousProcesses = processes
         snapshot = current
         processes = collectProcessActivity ? processReader.sample() : []
+        lastSensorSnapshot = current
+        let recordedEvent = await detectEvents(previous: previous, current: current, previousProcesses: previousProcesses)
         if current.date.timeIntervalSince(lastRecordedAt) >= 60 {
             await store.record(snapshot: current, processes: processes)
             lastRecordedAt = current.date
+            await loadHistory()
+        } else if recordedEvent {
             await loadHistory()
         }
     }
@@ -104,9 +126,89 @@ final class AppModel {
         await store.clear()
         historyError = await store.lastPersistenceError
         if historyError == nil {
+            lastEventAt.removeAll()
+            lastSensorSnapshot = nil
             lastRecordedAt = .distantPast
         }
         await loadHistory()
+    }
+
+
+    private func detectEvents(previous: BatterySnapshot?, current: BatterySnapshot, previousProcesses: [ProcessImpact]) async -> Bool {
+        var detected: [(TimelineEventKind, String?)] = []
+        if let previous, previous.source != .unknown, current.source != .unknown, previous.source != current.source {
+            if current.source == .charger { detected.append((.chargerConnected, nil)) }
+            if current.source == .battery { detected.append((.chargerDisconnected, nil)) }
+        }
+        if current.percentage <= 20 && (previous?.percentage ?? 21) > 20 {
+            detected.append((.lowBattery, nil))
+        }
+        if previous?.state != .full && current.state == .full {
+            detected.append((.fullCharge, nil))
+        }
+        if current.source == .battery, (previous == nil || previous?.source == .battery),
+           let drain = current.drainWatts,
+           drain >= settings.highDrainThreshold,
+           (previous?.drainWatts ?? 0) < settings.highDrainThreshold {
+            detected.append((.highDrain, String(format: "%.1f W drain", drain)))
+        }
+        if collectProcessActivity, let top = processes.first, top.cpuPercent >= 120,
+           (previousProcesses.first(where: { $0.pid == top.pid })?.cpuPercent ?? 0) < 120 {
+            detected.append((.processSpike, "\(top.name) reached \(Int(top.cpuPercent))% CPU"))
+        }
+        if let temp = current.temperatureCelsius,
+           temp >= settings.highTemperatureThreshold,
+           (previous?.temperatureCelsius ?? 0) < settings.highTemperatureThreshold {
+            detected.append((.highTemperature, String(format: "%.1f°C", temp)))
+        }
+        if let health = current.healthPercent, previous != nil,
+           health <= settings.healthThreshold,
+           (previous?.healthPercent ?? 101) > settings.healthThreshold {
+            detected.append((.healthDrop, String(format: "%.0f%% health", health)))
+        }
+        var recorded = false
+        for (kind, detail) in detected {
+            recorded = await recordEvent(kind, at: current.date, detail: detail) || recorded
+        }
+        return recorded
+    }
+
+    private func observeSleepAndWake() {
+        guard workspaceObservers.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            let date = Date.now
+            MainActor.assumeIsolated { self?.pendingSleepAt = date }
+        })
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            let date = Date.now
+            MainActor.assumeIsolated { self?.recordWake(at: date) }
+        })
+    }
+
+    private func recordWake(at date: Date) {
+        guard let sleepAt = pendingSleepAt, sleepAt < date else { return }
+        pendingSleepAt = nil
+        Task {
+            _ = await recordEvent(.sleep, at: sleepAt, detail: nil)
+            _ = await recordEvent(.wake, at: date, detail: nil)
+            await loadHistory()
+            await refresh()
+        }
+    }
+
+    @discardableResult
+    private func recordEvent(_ kind: TimelineEventKind, at date: Date, detail: String?) async -> Bool {
+        let cooldown: TimeInterval = switch kind {
+        case .highDrain, .highTemperature, .processSpike: 15 * 60
+        case .healthDrop: 24 * 60 * 60
+        default: 0
+        }
+        if date.timeIntervalSince(lastEventAt[kind] ?? .distantPast) < cooldown { return false }
+        let event = TimelineEvent(date: date, kind: kind, detail: detail)
+        lastEventAt[kind] = date
+        await store.record(event: event)
+        return true
     }
 
     private static func loadSettings() -> AppSettings {
