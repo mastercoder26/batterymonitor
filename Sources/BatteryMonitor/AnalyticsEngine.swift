@@ -14,6 +14,12 @@ struct HistoryMetrics: Sendable {
     var screenOnHours: Double? = nil
 }
 
+struct BatteryForecast: Sendable {
+    var currentHours: Double?
+    var lightUsageHours: Double?
+    var heavyUsageHours: Double?
+    var basis: String
+}
 struct DailyBatteryUse: Sendable, Identifiable {
     var id: Date { date }
     var date: Date
@@ -26,9 +32,19 @@ struct BatteryHealthPoint: Sendable, Identifiable {
     var date: Date
     var healthPercent: Double
 }
+struct ExperimentComparison: Sendable {
+    var firstAverageWatts: Double
+    var secondAverageWatts: Double
+    /// Positive means the second interval drew less power.
+    var wattsSaved: Double
+    var percentSaved: Double
+    var firstSampleCount: Int
+    var secondSampleCount: Int
+}
 
 struct BatteryAnalytics: Sendable {
     var metrics: HistoryMetrics
+    var forecast: BatteryForecast
     var dailyUse: [DailyBatteryUse]
     var healthTrend: [BatteryHealthPoint]
 }
@@ -38,6 +54,7 @@ enum AnalyticsEngine {
                           now: Date = .now, calendar: Calendar = .current) -> BatteryAnalytics {
         BatteryAnalytics(
             metrics: metrics(history, now: now),
+            forecast: forecast(current: current ?? history.snapshots.last, history: history),
             dailyUse: dailyUse(history, calendar: calendar),
             healthTrend: healthTrend(history, calendar: calendar)
         )
@@ -78,6 +95,38 @@ enum AnalyticsEngine {
         )
     }
 
+    static func forecast(current: BatterySnapshot?, history: BatteryHistory) -> BatteryForecast {
+        guard let current, current.source == .battery, current.percentage > 0 else {
+            return BatteryForecast(currentHours: nil, lightUsageHours: nil, heavyUsageHours: nil,
+                                   basis: "Available while running on battery")
+        }
+        let watts = history.snapshots.compactMap { sample -> Double? in
+            guard sample.source == .battery, let draw = sample.drainWatts,
+                  draw > 0, draw.isFinite else { return nil }
+            return draw
+        }.sorted()
+        let capacityWh: Double? = {
+            guard let mAh = current.maxCapacityMAh, mAh > 0,
+                  let volts = current.voltageVolts, volts > 0 else { return nil }
+            return Double(mAh) * volts / 1_000 * current.percentage / 100
+        }()
+        if let capacityWh, !watts.isEmpty {
+            let light = percentile(watts, 0.20)
+            let heavy = percentile(watts, 0.80)
+            let currentDraw = (current.drainWatts ?? 0) > 0 ? current.drainWatts! : percentile(watts, 0.50)
+            return BatteryForecast(currentHours: capacityWh / currentDraw,
+                                   lightUsageHours: capacityWh / light,
+                                   heavyUsageHours: capacityWh / heavy,
+                                   basis: "Measured battery draw and recent workload")
+        }
+        let rate = metrics(history).averageDischargePercentPerHour
+        let derived = rate.flatMap { $0 > 0 ? current.percentage / $0 : nil }
+        let os = current.timeRemainingMinutes.map { Double($0) / 60 }
+        return BatteryForecast(currentHours: derived ?? os,
+                               lightUsageHours: nil, heavyUsageHours: nil,
+                               basis: derived == nil ? "System estimate" : "Observed discharge rate")
+    }
+
     static func dailyUse(_ history: BatteryHistory, calendar: Calendar = .current) -> [DailyBatteryUse] {
         let samples = history.snapshots.sorted { $0.date < $1.date }
         var totals: [Date: (consumed: Double, hours: Double)] = [:]
@@ -100,5 +149,21 @@ enum AnalyticsEngine {
             days[day] = BatteryHealthPoint(date: day, healthPercent: health)
         }
         return days.values.sorted { $0.date < $1.date }
+    }
+
+    static func compareExperiment(first: [BatterySnapshot], second: [BatterySnapshot]) -> ExperimentComparison? {
+        let a = first.compactMap { $0.source == .battery ? $0.drainWatts : nil }.filter { $0 > 0 && $0.isFinite }
+        let b = second.compactMap { $0.source == .battery ? $0.drainWatts : nil }.filter { $0 > 0 && $0.isFinite }
+        guard a.count >= 3, b.count >= 3 else { return nil }
+        let firstMean = a.reduce(0, +) / Double(a.count)
+        let secondMean = b.reduce(0, +) / Double(b.count)
+        let saved = firstMean - secondMean
+        return ExperimentComparison(firstAverageWatts: firstMean, secondAverageWatts: secondMean,
+                                    wattsSaved: saved, percentSaved: saved / firstMean * 100,
+                                    firstSampleCount: a.count, secondSampleCount: b.count)
+    }
+
+    private static func percentile(_ sorted: [Double], _ fraction: Double) -> Double {
+        sorted[Int((Double(sorted.count - 1) * fraction).rounded())]
     }
 }
