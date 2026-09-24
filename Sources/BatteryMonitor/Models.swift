@@ -49,3 +49,46 @@ struct ProcessImpact: Codable, Sendable, Identifiable {
     var cpuPercent: Double
     var estimatedShare: Double
 }
+
+enum TimelineEventKind: String, Codable, Sendable {
+    case chargerConnected, chargerDisconnected, sleep, wake, highDrain, lowBattery, fullCharge, processSpike, highTemperature, healthDrop
+    var label: String {
+        switch self {
+        case .chargerConnected: "Charger connected"
+        case .chargerDisconnected: "Charger disconnected"
+        case .sleep: "Mac went to sleep"
+        case .wake: "Mac woke up"
+        case .highDrain: "High power usage"
+        case .lowBattery: "Battery reached 20%"
+        case .fullCharge: "Full charge reached"
+        case .processSpike: "App activity spike"
+        case .highTemperature: "High battery temperature"
+        case .healthDrop: "Battery health threshold reached"
+        }
+    }
+}
+
+struct TimelineEvent: Codable, Sendable, Identifiable {
+    var id: UUID = UUID()
+    var date: Date
+    var kind: TimelineEventKind
+    var detail: String?
+}
+
+struct ChargingSession: Codable, Sendable, Identifiable {
+    var id: UUID = UUID()
+    var start: Date
+    var end: Date?
+    var startPercent: Double
+    var endPercent: Double
+    var peakWatts: Double?
+    var averageWatts: Double?
+}
+
+enum HistoryPeriod: String, CaseIterable, Identifiable {
+    case today = "Today", week = "Week", month = "Month"
+    var id: String { rawValue }
+    var interval: TimeInterval {
+        switch self { case .today: 86_400; case .week: 7 * 86_400; case .month: 30 * 86_400 }
+    }
+}
