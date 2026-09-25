@@ -6,6 +6,9 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
     case timeline = "Timeline"
     case insights = "Insights"
     case health = "Health"
+    case charging = "Charging"
+    case experiments = "Experiments"
+    case settings = "Settings"
 
     var id: String { rawValue }
     var symbol: String {
@@ -14,6 +17,9 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
         case .timeline: "chart.xyaxis.line"
         case .insights: "sparkle.magnifyingglass"
         case .health: "heart.text.square"
+        case .charging: "bolt.circle"
+        case .experiments: "flask"
+        case .settings: "gearshape"
         }
     }
 }
@@ -21,6 +27,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
 struct ContentView: View {
     @Environment(AppModel.self) private var model
     @State private var selection: DashboardPage? = .overview
+    @State private var showingClearHistoryConfirmation = false
 
     var body: some View {
         NavigationSplitView {
@@ -49,6 +56,9 @@ struct ContentView: View {
                     case .timeline: timeline
                     case .insights: insights
                     case .health: health
+                    case .charging: charging
+                    case .experiments: experiments
+                    case .settings: settings
                     }
                 }
                 .frame(maxWidth: 1120, alignment: .leading)
@@ -59,6 +69,14 @@ struct ContentView: View {
         }
         .frame(minWidth: 900, minHeight: 650)
         .tint(.green)
+        .alert("Clear battery history?", isPresented: $showingClearHistoryConfirmation) {
+            Button("Cancel", role: .cancel) { }
+            Button("Clear History", role: .destructive) {
+                Task { await model.clearHistory() }
+            }
+        } message: {
+            Text("This permanently deletes saved battery readings, events, and process activity from this Mac.")
+        }
     }
 
     private var header: some View {
@@ -377,6 +395,194 @@ struct ContentView: View {
         }
     }
 
+    private var charging: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            periodPicker
+            if let snapshot = model.snapshot {
+                HStack(spacing: 18) {
+                    DashboardCard { compactMetric("Adapter", value: snapshot.adapterWatts.map { "\($0) W" } ?? "Unavailable", symbol: "powerplug") }
+                    DashboardCard { compactMetric("Delivered to battery", value: format(snapshot.chargeWatts, suffix: "W"), symbol: "bolt.fill") }
+                    DashboardCard { compactMetric("Time to full", value: snapshot.source == .charger ? systemTime(snapshot) : "Not connected", symbol: "clock") }
+                    DashboardCard { compactMetric("Charger", value: snapshot.adapterName ?? "Unknown", symbol: "cable.connector") }
+                }
+                if let adapter = snapshot.adapterWatts, let charging = snapshot.chargeWatts, snapshot.source == .charger {
+                    Text("Adapter rated at \(adapter) W; battery is currently receiving about \(String(format: "%.1f", charging)) W. Charging power changes with battery level and workload.")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
+                if snapshot.source == .charger, let drain = snapshot.drainWatts, drain > 0 {
+                    Label("Battery is still discharging at \(String(format: "%.1f", drain)) W while connected. The adapter may not cover the current workload.", systemImage: "exclamationmark.triangle")
+                        .font(.subheadline)
+                        .foregroundStyle(.orange)
+                }
+                Text("USB-C port identity is not reported by this battery data source.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let session = model.sessions.max(by: { $0.start < $1.start }) {
+                DashboardCard {
+                    SectionHeading(title: "Latest charging curve", detail: "Battery level during the recorded session")
+                    ChargingCurveChart(samples: model.samples.filter { $0.date >= session.start && $0.date <= (session.end ?? .now) })
+                        .frame(height: 220)
+                }
+            }
+            DashboardCard {
+                SectionHeading(title: "Charging sessions", detail: "Sessions captured while Battery Monitor was running")
+                if model.sessions.isEmpty {
+                    InlineEmpty(message: "Connect a charger to start recording sessions.")
+                } else {
+                    ForEach(model.sessions.sorted { $0.start > $1.start }.prefix(12)) { session in
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("\(Int(session.startPercent.rounded()))% → \(Int(session.endPercent.rounded()))%")
+                                    .font(.headline)
+                                Text(session.start.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            VStack(alignment: .trailing, spacing: 3) {
+                                Text(sessionDuration(session))
+                                Text("Avg \(format(session.averageWatts, suffix: "W")) · Peak \(format(session.peakWatts, suffix: "W"))")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 9)
+                        Divider()
+                    }
+                }
+            }
+            DashboardCard {
+                SectionHeading(title: "Temperature history", detail: "Battery temperature reported by the controller")
+                TemperatureChart(samples: model.samples)
+                    .frame(height: 220)
+            }
+        }
+    }
+
+    private var experiments: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            DashboardCard {
+                SectionHeading(title: "Compare two workloads", detail: "Run each for a similar length of time on battery")
+                Text("Battery Monitor compares average total system draw. Keep brightness, charging state, and background activity similar for a useful result.")
+                    .font(.subheadline).foregroundStyle(.secondary)
+                if model.snapshot?.source != .battery {
+                    Label("Unplug your Mac to start a comparison.", systemImage: "powerplug")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                if let experiment = model.experiment {
+                    Divider().padding(.vertical, 5)
+                    Text(experiment.title).font(.title3.weight(.semibold))
+                    Text(experiment.phase == .first ? "Step 1: \(experiment.firstLabel)" : experiment.phase == .second ? "Step 2: \(experiment.secondLabel)" : "Comparison complete")
+                        .foregroundStyle(.secondary)
+                    if experiment.phase != .complete, let progress = model.experimentProgressText {
+                        Text(progress)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 12) {
+                        MetricPill(title: experiment.firstLabel, value: format(experiment.firstAverageWatts, suffix: "W"))
+                        MetricPill(title: experiment.secondLabel, value: format(experiment.secondAverageWatts, suffix: "W"))
+                    }
+                    if experiment.phase == .complete, let first = experiment.firstAverageWatts, let second = experiment.secondAverageWatts {
+                        Text("\(first <= second ? experiment.firstLabel : experiment.secondLabel) averaged \(String(format: "%.1f", abs(first - second))) W less system power during this run.")
+                            .font(.headline)
+                    }
+                    HStack {
+                        if experiment.phase != .complete {
+                            Button(experiment.phase == .first ? "Start second step" : "Finish comparison") { model.advanceExperiment() }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(!model.experimentCanAdvance)
+                        }
+                        Button("End experiment") { model.stopExperiment() }
+                            .buttonStyle(.bordered)
+                    }
+                } else {
+                    HStack(spacing: 12) {
+                        experimentButton("Chrome vs Safari", symbol: "globe")
+                        experimentButton("Bright vs Dim", symbol: "sun.max")
+                        experimentButton("Focused vs Background Apps", symbol: "square.stack")
+                    }
+                    .padding(.top, 8)
+                }
+            }
+        }
+    }
+
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            DashboardCard {
+                SectionHeading(title: "Menu bar", detail: "Choose the compact reading shown beside the battery icon")
+                Picker("Display", selection: Binding(get: { model.settings.menuStyle }, set: { model.settings.menuStyle = $0 })) {
+                    ForEach(AppSettings.MenuStyle.allCases, id: \.self) { style in
+                        Text(style.label).tag(style)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+            DashboardCard {
+                SectionHeading(title: "Notifications", detail: "Alerts are sent only when a threshold or event occurs")
+                settingsToggle("Low battery", keyPath: \.lowBatteryAlert)
+                settingsToggle("Full charge", keyPath: \.fullChargeAlert)
+                settingsToggle("High drain", keyPath: \.highDrainAlert)
+                settingsToggle("High temperature", keyPath: \.highTemperatureAlert)
+                settingsToggle("Battery health threshold", keyPath: \.healthAlert)
+                settingsToggle("Charger disconnected", keyPath: \.chargerDisconnectedAlert)
+                settingsToggle("Charge target reached", keyPath: \.chargeTargetAlert)
+                HStack {
+                    Text("Charge target")
+                    Spacer()
+                    Stepper("\(model.settings.chargeTargetPercent)%", value: Binding(get: { model.settings.chargeTargetPercent }, set: { model.settings.chargeTargetPercent = $0 }), in: 50...100, step: 5)
+                        .fixedSize()
+                }
+                HStack {
+                    Text("High drain threshold")
+                    Spacer()
+                    Stepper("\(Int(model.settings.highDrainThreshold)) W", value: Binding(get: { model.settings.highDrainThreshold }, set: { model.settings.highDrainThreshold = $0 }), in: 5...80, step: 1)
+                        .fixedSize()
+                }
+                HStack {
+                    Text("High temperature threshold")
+                    Spacer()
+                    Stepper("\(Int(model.settings.highTemperatureThreshold))°C", value: Binding(get: { model.settings.highTemperatureThreshold }, set: { model.settings.highTemperatureThreshold = $0 }), in: 35...65, step: 1)
+                        .fixedSize()
+                }
+                HStack {
+                    Text("Battery health threshold")
+                    Spacer()
+                    Stepper("\(Int(model.settings.healthThreshold))%", value: Binding(get: { model.settings.healthThreshold }, set: { model.settings.healthThreshold = $0 }), in: 50...100, step: 5)
+                        .fixedSize()
+                }
+            }
+            DashboardCard {
+                SectionHeading(title: "Data & privacy", detail: "Your battery history stays on this Mac")
+                Text("Battery Monitor stores readings and events locally for up to 90 days. Process activity can include the names of apps that were active; it is used to estimate likely contributors and is never a per-app watt measurement.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Toggle("Collect process activity", isOn: Binding(
+                    get: { model.collectProcessActivity },
+                    set: { model.collectProcessActivity = $0 }
+                ))
+                .toggleStyle(.switch)
+                Text("Turn this off to stop collecting process names. Battery readings and battery events continue to be recorded.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Divider()
+                HStack(alignment: .center) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Clear saved history").fontWeight(.medium)
+                        Text("Remove all locally saved readings, events, and activity.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Clear History", role: .destructive) {
+                        showingClearHistoryConfirmation = true
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+    }
+
     private var periodPicker: some View {
         Picker("Period", selection: Binding(get: { model.selectedPeriod }, set: { model.selectedPeriod = $0 })) {
             ForEach(HistoryPeriod.allCases) { period in Text(period.rawValue).tag(period) }
@@ -427,6 +633,21 @@ struct ContentView: View {
     private func forecastHours(_ hours: Double?) -> String {
         guard let hours, hours > 0, hours.isFinite else { return "Unavailable" }
         return "~" + duration(Int((hours * 60).rounded()))
+    }
+
+    private func experimentButton(_ name: String, symbol: String) -> some View {
+        Button { model.startExperiment(name: name) } label: {
+            Label(name, systemImage: symbol)
+                .frame(maxWidth: .infinity, minHeight: 52)
+        }
+        .buttonStyle(.bordered)
+        .disabled(model.snapshot?.source != .battery)
+    }
+
+    private func settingsToggle(_ title: String, keyPath: WritableKeyPath<AppSettings, Bool>) -> some View {
+        Toggle(title, isOn: Binding(get: { model.settings[keyPath: keyPath] }, set: { model.settings[keyPath: keyPath] = $0 }))
+            .toggleStyle(.switch)
+            .frame(maxWidth: .infinity)
     }
 
     private func compactMetric(_ title: String, value: String, symbol: String) -> some View {
@@ -615,6 +836,11 @@ struct ContentView: View {
         return months >= 12 ? "\(months / 12)y \(months % 12)m" : "\(months)m"
     }
 
+    private func sessionDuration(_ session: ChargingSession) -> String {
+        guard let end = session.end else { return "In progress" }
+        return duration(Int(end.timeIntervalSince(session.start) / 60))
+    }
+
     private func eventSymbol(_ kind: TimelineEventKind) -> String {
         switch kind {
         case .chargerConnected: "powerplug.fill"
@@ -629,6 +855,7 @@ struct ContentView: View {
         case .healthDrop: "heart.slash"
         }
     }
+}
 
 private struct HealthPoint: Identifiable {
     var id: Date { date }
@@ -737,4 +964,44 @@ private struct BatteryChart: View {
     }
 }
 
+private struct TemperatureChart: View {
+    let samples: [BatterySnapshot]
+    var body: some View {
+        let points = samples.compactMap { sample -> TemperaturePoint? in
+            sample.temperatureCelsius.map { TemperaturePoint(date: sample.date, value: $0) }
+        }
+        if points.count > 1 {
+            Chart(points) { point in
+                LineMark(x: .value("Time", point.date), y: .value("Temperature", point.value))
+                    .foregroundStyle(.orange)
+                    .lineStyle(StrokeStyle(lineWidth: 2.5))
+            }
+        } else {
+            InlineEmpty(message: "Temperature history will appear when readings are available.")
+        }
+    }
+}
+
+private struct TemperaturePoint: Identifiable {
+    var id: Date { date }
+    let date: Date
+    let value: Double
+}
+
+private struct ChargingCurveChart: View {
+    let samples: [BatterySnapshot]
+    var body: some View {
+        if samples.count > 1 {
+            Chart(samples.sorted { $0.date < $1.date }) { sample in
+                AreaMark(x: .value("Time", sample.date), yStart: .value("Zero", 0), yEnd: .value("Battery", sample.percentage))
+                    .foregroundStyle(.blue.opacity(0.13))
+                LineMark(x: .value("Time", sample.date), y: .value("Battery", sample.percentage))
+                    .foregroundStyle(.blue)
+                    .lineStyle(StrokeStyle(lineWidth: 2.5))
+            }
+            .chartYScale(domain: 0...100)
+        } else {
+            InlineEmpty(message: "The charging curve will appear after a few saved readings.")
+        }
+    }
 }
