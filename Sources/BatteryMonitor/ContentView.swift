@@ -3,11 +3,17 @@ import SwiftUI
 
 private enum DashboardPage: String, CaseIterable, Identifiable {
     case overview = "Overview"
+    case timeline = "Timeline"
+    case insights = "Insights"
+    case health = "Health"
 
     var id: String { rawValue }
     var symbol: String {
         switch self {
         case .overview: "square.grid.2x2.fill"
+        case .timeline: "chart.xyaxis.line"
+        case .insights: "sparkle.magnifyingglass"
+        case .health: "heart.text.square"
         }
     }
 }
@@ -40,6 +46,9 @@ struct ContentView: View {
                     }
                     switch selection ?? .overview {
                     case .overview: overview
+                    case .timeline: timeline
+                    case .insights: insights
+                    case .health: health
                     }
                 }
                 .frame(maxWidth: 1120, alignment: .leading)
@@ -160,6 +169,266 @@ struct ContentView: View {
         }
     }
 
+    private var timeline: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            periodPicker
+            DashboardCard {
+                SectionHeading(title: "Battery timeline", detail: "Charge level and recorded events")
+                BatteryChart(samples: filteredSamples(model.selectedPeriod), events: filteredEvents)
+                    .frame(height: 310)
+            }
+            DashboardCard {
+                SectionHeading(title: "Flight recorder", detail: "Events captured while Battery Monitor was running")
+                let events = filteredEvents
+                if events.isEmpty {
+                    InlineEmpty(message: "No events recorded in this period.")
+                } else {
+                    ForEach(events.sorted { $0.date > $1.date }) { event in
+                        HStack(spacing: 12) {
+                            Image(systemName: eventSymbol(event.kind))
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(event.kind == .highDrain || event.kind == .lowBattery ? .orange : .accentColor)
+                                .frame(width: 30)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(event.kind.label).fontWeight(.medium)
+                                if let detail = event.detail, !detail.isEmpty {
+                                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Text(event.date.formatted(date: model.selectedPeriod == .today ? .omitted : .abbreviated, time: .shortened))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 7)
+                    }
+                }
+            }
+        }
+    }
+
+    private var insights: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            periodPicker
+            HStack(alignment: .top, spacing: 18) {
+                DashboardCard {
+                    SectionHeading(title: "Real-time drain", detail: "Battery discharge at this moment")
+                    if let snapshot = model.snapshot, let watts = snapshot.drainWatts, watts > 0 {
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
+                            Text(watts, format: .number.precision(.fractionLength(1)))
+                                .font(.system(size: 52, weight: .bold, design: .rounded))
+                            Text("W").font(.title2).foregroundStyle(.secondary)
+                        }
+                        Text(drainLabel(watts))
+                            .font(.headline)
+                            .foregroundStyle(watts >= model.settings.highDrainThreshold ? .orange : .green)
+                        Text("The threshold is configurable in Settings. Constant use estimate: \(constantUseTime(snapshot)).")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    } else {
+                        InlineEmpty(message: "Drain appears while running on battery.")
+                    }
+                }
+                DashboardCard {
+                    SectionHeading(title: "Today's efficiency", detail: "Experimental score from today's observed battery use")
+                    if let efficiency = todayEfficiency {
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
+                            Text("\(efficiency.score)")
+                                .font(.system(size: 52, weight: .bold, design: .rounded))
+                            Text("/ 100").font(.title2).foregroundStyle(.secondary)
+                        }
+                        Text("Average measured drain: \(String(format: "%.1f", efficiency.averageWatts)) W" + (efficiency.averageTemperature.map { " · Temperature: \(String(format: "%.1f", $0))°C" } ?? ""))
+                            .font(.subheadline)
+                        Text("Lower sustained draw and temperature raise this experimental score. It does not measure battery health or per-app watts.")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    } else {
+                        InlineEmpty(message: "Needs at least five saved readings spanning ten minutes on battery today.")
+                    }
+                }
+            }
+            DashboardCard {
+                SectionHeading(title: "What drained my battery?", detail: "Likely contributors from readings recorded during the drain")
+                if let episode = model.analytics?.drainEpisodes.first {
+                    Text("Battery dropped \(Int(episode.percentLost.rounded()))% between \(episode.start.formatted(date: .omitted, time: .shortened)) and \(episode.end.formatted(date: .omitted, time: .shortened)).")
+                        .font(.headline)
+                    if let average = episode.averageWatts {
+                        Text("Average draw: \(String(format: "%.1f", average)) W")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    ForEach(episode.contributors) { contributor in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(contributor.title).fontWeight(.medium)
+                            Text(contributor.explanation).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Text("These are correlations from sampled activity, not measured per-app battery watts.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if let drop = largestDrop {
+                    Text("Battery dropped \(Int(drop.amount.rounded()))% between \(drop.start.formatted(date: .omitted, time: .shortened)) and \(drop.end.formatted(date: .omitted, time: .shortened)).")
+                        .font(.headline)
+                    Text("A larger recorded interval is needed for contributor analysis.")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                } else {
+                    InlineEmpty(message: "More battery history is needed to identify a drain interval.")
+                }
+            }
+            DashboardCard {
+                SectionHeading(title: "App power usage", detail: "CPU-based activity estimate; per-app watts are not available from this source")
+                processList(limit: 10)
+            }
+            DashboardCard {
+                SectionHeading(title: "Battery forecast", detail: "Simple scenarios from observed discharge rates")
+                forecastContent
+            }
+            DashboardCard {
+                SectionHeading(title: "Usage history", detail: "Measured while Battery Monitor was running")
+                if let metrics = model.analytics?.metrics {
+                    HStack(spacing: 12) {
+                        MetricPill(title: "Battery consumed", value: String(format: "%.0f%%", metrics.batteryConsumedPercent))
+                        MetricPill(title: "Average discharge", value: metrics.averageDischargePercentPerHour.map { String(format: "%.1f%%/h", $0) } ?? "Unavailable")
+                        MetricPill(title: "Charging sessions", value: "\(metrics.chargingSessionCount)")
+                        MetricPill(title: "Plugged in", value: String(format: "%.1f h", metrics.pluggedInHours))
+                    }
+                    HStack(spacing: 12) {
+                        MetricPill(title: "Above 80%", value: String(format: "%.1f h", metrics.above80PercentHours))
+                        MetricPill(title: "Average charge start", value: metrics.averageChargeStartPercent.map { String(format: "%.0f%%", $0) } ?? "Unavailable")
+                        MetricPill(title: "Cycle count change", value: metrics.cycleCountChange.map(String.init) ?? "Unavailable")
+                        MetricPill(title: "Screen-on time", value: "Unavailable")
+                    }
+                } else {
+                    InlineEmpty(message: "History totals will appear after readings are saved.")
+                }
+            }
+            DashboardCard {
+                SectionHeading(title: "Daily battery use", detail: "Color shows battery consumed while sampling was active")
+                let useByDay = Dictionary(uniqueKeysWithValues: (model.analytics?.dailyUse ?? []).map { (Calendar.current.startOfDay(for: $0.date), $0) })
+                if useByDay.isEmpty {
+                    InlineEmpty(message: "Daily use will appear as history builds up.")
+                } else {
+                    HStack(spacing: 0) {
+                        ForEach(0..<7, id: \.self) { index in
+                            Text(weekdayName(index))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 7), count: 7), spacing: 7) {
+                        ForEach(0..<heatmapLeadingDays, id: \.self) { _ in
+                            Color.clear.frame(height: 35)
+                        }
+                        ForEach(heatmapDates, id: \.self) { date in
+                            let day = useByDay[date]
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(day.map { Color.green.opacity(min(0.9, max(0.15, $0.consumedPercent / 150))) } ?? Color(nsColor: .separatorColor).opacity(0.25))
+                                .frame(height: 35)
+                                .help(day.map { "\(date.formatted(date: .abbreviated, time: .omitted)): \(Int($0.consumedPercent.rounded()))% consumed over \(String(format: "%.1f", $0.observedHours)) h observed" } ?? "\(date.formatted(date: .abbreviated, time: .omitted)): no readings")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var health: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            periodPicker
+            if let snapshot = model.snapshot {
+                HStack(spacing: 18) {
+                    DashboardCard { compactMetric("Battery health", value: format(snapshot.healthPercent, suffix: "%", digits: 0), symbol: "heart.fill") }
+                    DashboardCard { compactMetric("Maximum capacity", value: snapshot.maxCapacityMAh.map { "\($0) mAh" } ?? "Unavailable", symbol: "battery.100percent") }
+                    DashboardCard { compactMetric("Design capacity", value: snapshot.designCapacityMAh.map { "\($0) mAh" } ?? "Unavailable", symbol: "shippingbox") }
+                    DashboardCard { compactMetric("Cycle count", value: snapshot.cycleCount.map(String.init) ?? "Unavailable", symbol: "arrow.triangle.2.circlepath") }
+                }
+                DashboardCard {
+                    SectionHeading(title: "Capacity over time", detail: "Measured health from saved battery readings")
+                    let points = healthSamples
+                    if points.count > 1 {
+                        let values = points.map(\.health)
+                        let lower = max(0, (values.min() ?? 90) - 3)
+                        let upper = min(110, (values.max() ?? 100) + 3)
+                        Chart(points) { point in
+                            AreaMark(x: .value("Date", point.date), yStart: .value("Chart baseline", lower), yEnd: .value("Health", point.health))
+                                .foregroundStyle(.green.opacity(0.12))
+                            LineMark(x: .value("Date", point.date), y: .value("Health", point.health))
+                                .foregroundStyle(.green)
+                                .lineStyle(StrokeStyle(lineWidth: 2.5))
+                        }
+                        .chartYScale(domain: lower...max(lower + 1, upper))
+                        .frame(height: 250)
+                        if let trend = healthMonthlyTrend {
+                            Text(String(format: "Observed change: %+.2f percentage points per month", trend))
+                                .font(.subheadline.weight(.medium))
+                            Text("Based on observations at least a week apart. Short-term capacity readings can fluctuate.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    } else {
+                        InlineEmpty(message: "Health history will appear after multiple readings are saved.")
+                    }
+                }
+                DashboardCard {
+                    SectionHeading(title: "Battery details", detail: "Values reported by macOS and the battery controller")
+                    MetricRow(name: "Condition", value: snapshot.condition ?? "Unavailable")
+                    MetricRow(name: "Manufactured", value: snapshot.manufactureDate?.formatted(date: .abbreviated, time: .omitted) ?? "Unavailable")
+                    MetricRow(name: "Battery age", value: batteryAge(snapshot.manufactureDate))
+                    MetricRow(name: "Capacity lost", value: snapshot.healthPercent.map { String(format: "%.1f%%", max(0, 100 - $0)) } ?? "Unavailable")
+                }
+            } else {
+                EmptyDashboard(message: "Battery health data is unavailable until the first reading.", symbol: "heart.text.square")
+            }
+        }
+    }
+
+    private var periodPicker: some View {
+        Picker("Period", selection: Binding(get: { model.selectedPeriod }, set: { model.selectedPeriod = $0 })) {
+            ForEach(HistoryPeriod.allCases) { period in Text(period.rawValue).tag(period) }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 280)
+    }
+
+    @ViewBuilder private var forecastContent: some View {
+        if let forecast = model.analytics?.forecast {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    MetricPill(title: "Current workload", value: forecastHours(forecast.currentHours))
+                    MetricPill(title: "Light observed use", value: forecastHours(forecast.lightUsageHours))
+                    MetricPill(title: "Heavy observed use", value: forecastHours(forecast.heavyUsageHours))
+                }
+                Text(forecast.basis).font(.caption).foregroundStyle(.secondary)
+            }
+        } else {
+            let draws = model.samples.compactMap(\.drainWatts).filter { $0 > 0 }
+            let sorted = draws.sorted()
+            HStack(spacing: 12) {
+                MetricPill(title: "Current workload", value: model.snapshot.map(constantUseTime) ?? "Unavailable")
+                MetricPill(title: "Light observed use", value: forecast(draw: sorted.isEmpty ? nil : sorted[sorted.count / 4]))
+                MetricPill(title: "Heavy observed use", value: forecast(draw: sorted.isEmpty ? nil : sorted[sorted.count * 3 / 4]))
+            }
+        }
+    }
+
+    private var heatmapDates: [Date] {
+        let calendar = Calendar.current
+        let start = calendar.startOfDay(for: calendar.date(byAdding: .day, value: -34, to: .now) ?? .now)
+        return (0..<35).compactMap { calendar.date(byAdding: .day, value: $0, to: start) }
+    }
+
+    private var heatmapLeadingDays: Int {
+        guard let first = heatmapDates.first else { return 0 }
+        let calendar = Calendar.current
+        return (calendar.component(.weekday, from: first) - calendar.firstWeekday + 7) % 7
+    }
+
+    private func weekdayName(_ index: Int) -> String {
+        let calendar = Calendar.current
+        let names = calendar.veryShortStandaloneWeekdaySymbols
+        return names[(calendar.firstWeekday - 1 + index) % 7]
+    }
+
+    private func forecastHours(_ hours: Double?) -> String {
+        guard let hours, hours > 0, hours.isFinite else { return "Unavailable" }
+        return "~" + duration(Int((hours * 60).rounded()))
+    }
+
     private func compactMetric(_ title: String, value: String, symbol: String) -> some View {
         VStack(alignment: .leading, spacing: 11) {
             Label(title.uppercased(), systemImage: symbol)
@@ -215,6 +484,10 @@ struct ContentView: View {
         }
     }
 
+    private var filteredEvents: [TimelineEvent] {
+        model.events.filter { $0.date >= Date().addingTimeInterval(-model.selectedPeriod.interval) }
+    }
+
     private var todayMovement: (drained: Double, charged: Double) {
         let points = filteredSamples(.today)
         var drained = 0.0
@@ -229,6 +502,45 @@ struct ContentView: View {
 
     private func filteredSamples(_ period: HistoryPeriod) -> [BatterySnapshot] {
         model.samples.filter { $0.date >= Date().addingTimeInterval(-period.interval) }.sorted { $0.date < $1.date }
+    }
+
+    private var healthSamples: [HealthPoint] {
+        model.samples.compactMap { snapshot in
+            snapshot.healthPercent.map { HealthPoint(date: snapshot.date, health: $0) }
+        }
+    }
+
+    private var healthMonthlyTrend: Double? {
+        let points = healthSamples.sorted { $0.date < $1.date }
+        guard let first = points.first, let last = points.last else { return nil }
+        let days = last.date.timeIntervalSince(first.date) / 86_400
+        guard days >= 7 else { return nil }
+        return (last.health - first.health) / days * 30
+    }
+
+    private var largestDrop: (start: Date, end: Date, amount: Double)? {
+        let samples = filteredSamples(model.selectedPeriod)
+        guard samples.count > 1 else { return nil }
+        var result: (Date, Date, Double)?
+        for pair in zip(samples, samples.dropFirst()) where pair.0.source == .battery && pair.1.source == .battery {
+            let delta = pair.0.percentage - pair.1.percentage
+            if delta > (result?.2 ?? 0) { result = (pair.0.date, pair.1.date, delta) }
+        }
+        return result.map { (start: $0.0, end: $0.1, amount: $0.2) }
+    }
+
+    private var todayEfficiency: (score: Int, averageWatts: Double, averageTemperature: Double?)? {
+        let readings = filteredSamples(.today).filter { $0.source == .battery && ($0.drainWatts ?? 0) > 0 }
+        guard readings.count >= 5,
+              let first = readings.first, let last = readings.last,
+              last.date.timeIntervalSince(first.date) >= 600 else { return nil }
+        let averageWatts = readings.compactMap(\.drainWatts).reduce(0, +) / Double(readings.count)
+        let temperatures = readings.compactMap(\.temperatureCelsius)
+        let averageTemperature = temperatures.isEmpty ? nil : temperatures.reduce(0, +) / Double(temperatures.count)
+        let drawPenalty = max(0, averageWatts - 8) * 2
+        let heatPenalty = max(0, (averageTemperature ?? 35) - 40) * 2
+        let score = Int(max(0, min(100, 100 - drawPenalty - heatPenalty)).rounded())
+        return (score, averageWatts, averageTemperature)
     }
 
     private func batteryColor(_ percentage: Double) -> Color {
@@ -295,6 +607,34 @@ struct ContentView: View {
         guard let value, value.isFinite else { return "Unavailable" }
         return String(format: "%.*f %@", digits, value, suffix)
     }
+
+    private func batteryAge(_ date: Date?) -> String {
+        guard let date else { return "Unavailable" }
+        let months = Calendar.current.dateComponents([.month], from: date, to: .now).month ?? 0
+        guard months >= 0 else { return "Unavailable" }
+        return months >= 12 ? "\(months / 12)y \(months % 12)m" : "\(months)m"
+    }
+
+    private func eventSymbol(_ kind: TimelineEventKind) -> String {
+        switch kind {
+        case .chargerConnected: "powerplug.fill"
+        case .chargerDisconnected: "powerplug"
+        case .sleep: "moon.zzz.fill"
+        case .wake: "sunrise.fill"
+        case .highDrain: "bolt.trianglebadge.exclamationmark.fill"
+        case .lowBattery: "battery.25percent"
+        case .fullCharge: "battery.100percent"
+        case .processSpike: "app.badge"
+        case .highTemperature: "thermometer.high"
+        case .healthDrop: "heart.slash"
+        }
+    }
+
+private struct HealthPoint: Identifiable {
+    var id: Date { date }
+    let date: Date
+    let health: Double
+}
 
 private struct DashboardCard<Content: View>: View {
     let content: Content
